@@ -2,23 +2,23 @@ use crate::history_cell::CompositeHistoryCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::with_border_with_inner_width;
+use crate::legacy_core::config::Config;
 use crate::version::CODEX_CLI_VERSION;
 use chrono::DateTime;
 use chrono::Local;
-use codex_core::WireApi;
-use codex_core::config::Config;
+use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::NetworkAccess;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
-use codex_utils_sandbox_summary::summarize_sandbox_policy;
+use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::path::PathBuf;
 use url::Url;
 
@@ -28,7 +28,6 @@ use super::format::line_display_width;
 use super::format::push_label;
 use super::format::truncate_line_to_width;
 use super::helpers::compose_account_display;
-use super::helpers::compose_agents_summary;
 use super::helpers::compose_model_display;
 use super::helpers::format_directory_display;
 use super::helpers::format_tokens_compact;
@@ -82,6 +81,7 @@ impl StatusHistoryHandle {
         } else {
             compose_rate_limit_data_many(rate_limits, now)
         };
+        #[expect(clippy::expect_used)]
         let mut state = self
             .rate_limit_state
             .write()
@@ -97,7 +97,7 @@ struct StatusHistoryCell {
     model_details: Vec<String>,
     directory: PathBuf,
     permissions: String,
-    agents_summary: String,
+    agents_summary: Arc<RwLock<String>>,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
     account: Option<StatusAccountDisplay>,
@@ -176,6 +176,7 @@ pub(crate) fn new_status_output_with_rate_limits(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        "<none>".to_string(),
         refreshing_rate_limits,
     )
     .0
@@ -196,6 +197,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     model_name: &str,
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    agents_summary: String,
     refreshing_rate_limits: bool,
 ) -> (CompositeHistoryCell, StatusHistoryHandle) {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
@@ -213,6 +215,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
         model_name,
         collaboration_mode,
         reasoning_effort_override,
+        agents_summary,
         refreshing_rate_limits,
     );
 
@@ -238,6 +241,7 @@ impl StatusHistoryCell {
         model_name: &str,
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
+        agents_summary: String,
         refreshing_rate_limits: bool,
     ) -> (Self, StatusHistoryHandle) {
         let mut config_entries = vec![
@@ -250,12 +254,15 @@ impl StatusHistoryCell {
             ),
             (
                 "sandbox",
-                summarize_sandbox_policy(config.permissions.sandbox_policy.get()),
+                summarize_permission_profile(
+                    &config.permissions.permission_profile(),
+                    config.cwd.as_path(),
+                ),
             ),
         ];
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
-                .unwrap_or(None)
+                .unwrap_or(config.model_reasoning_effort)
                 .map(|effort| effort.to_string())
                 .unwrap_or_else(|| "none".to_string());
             config_entries.push(("reasoning effort", effort_value));
@@ -273,35 +280,19 @@ impl StatusHistoryCell {
             .find(|(k, _)| *k == "approval")
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let sandbox = match config.permissions.sandbox_policy.get() {
-            SandboxPolicy::DangerFullAccess => "danger-full-access".to_string(),
-            SandboxPolicy::ReadOnly { .. } => "read-only".to_string(),
-            SandboxPolicy::WorkspaceWrite {
-                network_access: true,
-                ..
-            } => "workspace-write with network access".to_string(),
-            SandboxPolicy::WorkspaceWrite { .. } => "workspace-write".to_string(),
-            SandboxPolicy::ExternalSandbox { network_access } => {
-                if matches!(network_access, NetworkAccess::Enabled) {
-                    "external-sandbox (network access enabled)".to_string()
-                } else {
-                    "external-sandbox".to_string()
-                }
-            }
-        };
+        let permission_profile = config.permissions.permission_profile();
+        let sandbox = status_permission_summary(&permission_profile, config.cwd.as_path());
         let permissions = if config.permissions.approval_policy.value() == AskForApproval::OnRequest
-            && *config.permissions.sandbox_policy.get()
-                == SandboxPolicy::new_workspace_write_policy()
+            && permission_profile == PermissionProfile::workspace_write()
         {
             "Default".to_string()
         } else if config.permissions.approval_policy.value() == AskForApproval::Never
-            && *config.permissions.sandbox_policy.get() == SandboxPolicy::DangerFullAccess
+            && permission_profile == PermissionProfile::Disabled
         {
             "Full Access".to_string()
         } else {
             format!("Custom ({sandbox}, {approval})")
         };
-        let agents_summary = compose_agents_summary(config);
         let model_provider = format_model_provider(config);
         let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
@@ -332,6 +323,7 @@ impl StatusHistoryCell {
             rate_limits,
             refreshing_rate_limits,
         }));
+        let agents_summary = Arc::new(RwLock::new(agents_summary));
 
         (
             Self {
@@ -339,7 +331,6 @@ impl StatusHistoryCell {
                 model_details,
                 directory: config.cwd.to_path_buf(),
                 permissions,
-                agents_summary,
                 collaboration_mode: collaboration_mode.map(ToString::to_string),
                 model_provider,
                 account,
@@ -347,6 +338,7 @@ impl StatusHistoryCell {
                 session_id,
                 forked_from,
                 token_usage,
+                agents_summary,
                 rate_limit_state: rate_limit_state.clone(),
             },
             StatusHistoryHandle { rate_limit_state },
@@ -398,23 +390,11 @@ impl StatusHistoryCell {
                 if rows_data.is_empty() {
                     return vec![formatter.line(
                         "Limits",
-                        vec![if state.refreshing_rate_limits {
-                            Span::from("refreshing cached limits...").dim()
-                        } else {
-                            Span::from("data not available yet").dim()
-                        }],
+                        vec![Span::from("not available for this account").dim()],
                     )];
                 }
 
-                let mut lines =
-                    self.rate_limit_row_lines(rows_data, available_inner_width, formatter);
-                if state.refreshing_rate_limits {
-                    lines.push(formatter.line(
-                        "Notice",
-                        vec![Span::from("refreshing limits in background...").dim()],
-                    ));
-                }
-                lines
+                self.rate_limit_row_lines(rows_data, available_inner_width, formatter)
             }
             StatusRateLimitData::Stale(rows_data) => {
                 let mut lines =
@@ -422,7 +402,7 @@ impl StatusHistoryCell {
                 lines.push(formatter.line(
                     "Warning",
                     vec![Span::from(if state.refreshing_rate_limits {
-                        "limits may be stale - refreshing in background..."
+                        "limits may be stale - run /status again shortly."
                     } else {
                         "limits may be stale - start new turn to refresh."
                     })
@@ -430,11 +410,17 @@ impl StatusHistoryCell {
                 ));
                 lines
             }
+            StatusRateLimitData::Unavailable => {
+                vec![formatter.line(
+                    "Limits",
+                    vec![Span::from("not available for this account").dim()],
+                )]
+            }
             StatusRateLimitData::Missing => {
                 vec![formatter.line(
                     "Limits",
                     vec![Span::from(if state.refreshing_rate_limits {
-                        "refreshing limits..."
+                        "refresh requested; run /status again shortly."
                     } else {
                         "data not available yet"
                     })
@@ -459,11 +445,21 @@ impl StatusHistoryCell {
                     resets_at,
                 } => {
                     let percent_remaining = (100.0 - percent_used).clamp(0.0, 100.0);
-                    let value_spans = vec![
+                    let summary = format_status_limit_summary(percent_remaining);
+                    let full_value_spans = vec![
                         Span::from(render_status_limit_progress_bar(percent_remaining)),
                         Span::from(" "),
-                        Span::from(format_status_limit_summary(percent_remaining)),
+                        Span::from(summary.clone()),
                     ];
+                    // On narrow terminals, keep the percentage visible rather than
+                    // letting the fixed-width progress bar crowd out the reset time.
+                    let value_spans = if line_display_width(&Line::from(full_value_spans.clone()))
+                        <= formatter.value_width(available_inner_width)
+                    {
+                        full_value_spans
+                    } else {
+                        vec![Span::from(summary)]
+                    };
                     let base_spans = formatter.full_spans(row.label.as_str(), value_spans);
                     let base_line = Line::from(base_spans.clone());
 
@@ -479,7 +475,21 @@ impl StatusHistoryCell {
                             lines.push(Line::from(inline_spans));
                         } else {
                             lines.push(base_line);
-                            lines.push(formatter.continuation(vec![resets_span]));
+                            let reset_text = format!("(resets {resets_at})");
+                            let reset_width = formatter.value_width(available_inner_width).max(1);
+                            let wrap_options =
+                                textwrap::Options::new(reset_width).break_words(false);
+                            // Reset timestamps are the actionable part of this row, so wrap them
+                            // onto continuation lines instead of truncating partial times/dates.
+                            lines.extend(
+                                textwrap::wrap(reset_text.as_str(), wrap_options)
+                                    .into_iter()
+                                    .map(|wrapped| {
+                                        formatter.continuation(vec![
+                                            Span::from(wrapped.into_owned()).dim(),
+                                        ])
+                                    }),
+                            );
                         }
                     } else {
                         lines.push(base_line);
@@ -519,9 +529,24 @@ impl StatusHistoryCell {
                 }
                 push_label(labels, seen, "Warning");
             }
+            StatusRateLimitData::Unavailable => push_label(labels, seen, "Limits"),
             StatusRateLimitData::Missing => push_label(labels, seen, "Limits"),
         }
     }
+}
+
+fn status_permission_summary(permission_profile: &PermissionProfile, cwd: &Path) -> String {
+    let summary = summarize_permission_profile(permission_profile, cwd);
+    if let Some(details) = summary.strip_prefix("workspace-write") {
+        if details.contains("(network access enabled)") {
+            return "workspace-write with network access".to_string();
+        }
+        return "workspace-write".to_string();
+    }
+    if summary == "custom permissions (network access enabled)" {
+        return "custom permissions with network access".to_string();
+    }
+    summary
 }
 
 impl HistoryCell for StatusHistoryCell {
@@ -558,10 +583,17 @@ impl HistoryCell for StatusHistoryCell {
             .collect();
         let mut seen: BTreeSet<String> = labels.iter().cloned().collect();
         let thread_name = self.thread_name.as_deref().filter(|name| !name.is_empty());
+        #[expect(clippy::expect_used)]
         let rate_limit_state = self
             .rate_limit_state
             .read()
             .expect("status history rate-limit state poisoned");
+        #[expect(clippy::expect_used)]
+        let agents_summary = self
+            .agents_summary
+            .read()
+            .expect("status history agents summary state poisoned")
+            .clone();
 
         if self.model_provider.is_some() {
             push_label(&mut labels, &mut seen, "Model provider");
@@ -623,7 +655,7 @@ impl HistoryCell for StatusHistoryCell {
         }
         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
         lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
-        lines.push(formatter.line("Agents.md", vec![Span::from(self.agents_summary.clone())]));
+        lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
 
         if let Some(account_value) = account_value {
             lines.push(formatter.line("Account", vec![Span::from(account_value)]));
