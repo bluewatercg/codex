@@ -1,4 +1,5 @@
 use codex_features::FEATURES;
+use codex_features::Feature;
 use codex_protocol::account::PlanType;
 use lazy_static::lazy_static;
 use rand::Rng;
@@ -9,42 +10,44 @@ const ANNOUNCEMENT_TIP_URL: &str =
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
-const PAID_TOOLTIP: &str = "*New* Try the **Codex App** with 2x rate limits until *April 2nd*. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
-const PAID_TOOLTIP_WINDOWS: &str = "*New* Try the **Codex App**, now available on **Windows**, with 2x rate limits until *April 2nd*. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
-const PAID_TOOLTIP_NON_MAC: &str = "*New* 2x rate limits until *April 2nd*.";
-const FAST_TOOLTIP: &str = "*New* Use **/fast** to enable our fastest inference at 2X plan usage.";
-const OTHER_TOOLTIP: &str = "*New* Build faster with the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const APP_TOOLTIP: &str = "Try the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const MACOS_APP_TOOLTIP: &str =
+    "Run `codex app` to open the Desktop app (it installs on macOS if needed).";
+const LINUX_APP_TOOLTIP: &str = "Try the **Desktop app** on Linux: install it from https://learn.chatgpt.com/docs/linux/linux-app and run 'chatgpt'.";
+const FAST_TOOLTIP: &str =
+    "*New* Use **/fast** to enable our fastest inference with increased plan usage.";
+const OTHER_TOOLTIP: &str = "*New* Build faster with the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
 const FREE_GO_TOOLTIP: &str =
     "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
 
-const RAW_TOOLTIPS: &str = include_str!("../tooltips.txt");
+const RAW_TOOLTIPS: &str = include_str!("../assets/tooltips.txt");
 
 lazy_static! {
     static ref TOOLTIPS: Vec<&'static str> = RAW_TOOLTIPS
         .lines()
         .map(str::trim)
-        .filter(|line| {
-            if line.is_empty() || line.starts_with('#') {
-                return false;
-            }
-            if !IS_MACOS && !IS_WINDOWS && line.contains("codex app") {
-                return false;
-            }
-            true
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .chain(if IS_MACOS {
+            Some(MACOS_APP_TOOLTIP)
+        } else {
+            linux_app_tooltip(LinuxDesktopSession::current())
         })
         .collect();
     static ref ALL_TOOLTIPS: Vec<&'static str> = {
         let mut tips = Vec::new();
         tips.extend(TOOLTIPS.iter().copied());
-        tips.extend(experimental_tooltips());
+        tips.extend(experimental_tooltips(
+            codex_realtime_webrtc::RealtimeWebrtcSession::is_supported,
+        ));
         tips
     };
 }
 
-fn experimental_tooltips() -> Vec<&'static str> {
+fn experimental_tooltips(voice_supported: impl Fn() -> bool) -> Vec<&'static str> {
     FEATURES
         .iter()
+        .filter(|spec| spec.id != Feature::RealtimeConversation || voice_supported())
         .filter_map(|spec| spec.stage.experimental_announcement())
         .collect()
 }
@@ -53,7 +56,7 @@ fn experimental_tooltips() -> Vec<&'static str> {
 pub(crate) fn get_tooltip(plan: Option<PlanType>, fast_mode_enabled: bool) -> Option<String> {
     let mut rng = rand::rng();
 
-    if let Some(announcement) = announcement::fetch_announcement_tip() {
+    if let Some(announcement) = announcement::fetch_announcement_tip(plan) {
         return Some(announcement);
     }
 
@@ -63,11 +66,13 @@ pub(crate) fn get_tooltip(plan: Option<PlanType>, fast_mode_enabled: bool) -> Op
             Some(plan_type)
                 if matches!(
                     plan_type,
-                    PlanType::Plus | PlanType::Enterprise | PlanType::Pro
+                    PlanType::Plus | PlanType::Enterprise | PlanType::Pro | PlanType::ProLite
                 ) || plan_type.is_team_like()
                     || plan_type.is_business_like() =>
             {
-                return Some(pick_paid_tooltip(&mut rng, fast_mode_enabled).to_string());
+                if let Some(tooltip) = pick_paid_tooltip(&mut rng, fast_mode_enabled) {
+                    return Some(tooltip.to_string());
+                }
             }
             Some(PlanType::Go) | Some(PlanType::Free) => {
                 return Some(FREE_GO_TOOLTIP.to_string());
@@ -86,13 +91,41 @@ pub(crate) fn get_tooltip(plan: Option<PlanType>, fast_mode_enabled: bool) -> Op
     pick_tooltip(&mut rng).map(str::to_string)
 }
 
-fn paid_app_tooltip() -> &'static str {
-    if IS_MACOS {
-        PAID_TOOLTIP
-    } else if IS_WINDOWS {
-        PAID_TOOLTIP_WINDOWS
+struct LinuxDesktopSession {
+    has_display: bool,
+    is_wsl: bool,
+}
+
+impl LinuxDesktopSession {
+    fn current() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                has_display: std::env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+                    || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty()),
+                is_wsl: crate::clipboard_paste::is_probably_wsl(),
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {
+                has_display: false,
+                is_wsl: false,
+            }
+        }
+    }
+}
+
+fn linux_app_tooltip(session: LinuxDesktopSession) -> Option<&'static str> {
+    (session.has_display && !session.is_wsl).then_some(LINUX_APP_TOOLTIP)
+}
+
+fn paid_app_tooltip() -> Option<&'static str> {
+    if IS_MACOS || IS_WINDOWS {
+        Some(APP_TOOLTIP)
     } else {
-        PAID_TOOLTIP_NON_MAC
+        linux_app_tooltip(LinuxDesktopSession::current())
     }
 }
 
@@ -100,11 +133,14 @@ fn paid_app_tooltip() -> &'static str {
 /// generic random tip pool. Keep this business logic explicit: we currently split
 /// that slot between the app promo and Fast mode, but suppress the Fast promo once
 /// the user already has Fast mode enabled.
-fn pick_paid_tooltip<R: Rng + ?Sized>(rng: &mut R, fast_mode_enabled: bool) -> &'static str {
+fn pick_paid_tooltip<R: Rng + ?Sized>(
+    rng: &mut R,
+    fast_mode_enabled: bool,
+) -> Option<&'static str> {
     if fast_mode_enabled || rng.random_bool(0.5) {
         paid_app_tooltip()
     } else {
-        FAST_TOOLTIP
+        Some(FAST_TOOLTIP)
     }
 }
 
@@ -123,26 +159,36 @@ pub(crate) mod announcement {
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
+    use codex_http_client::ClientRouteClass;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::RouteAwareClientPool;
+    use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
     use std::sync::OnceLock;
-    use std::thread;
     use std::time::Duration;
 
     static ANNOUNCEMENT_TIP: OnceLock<Option<String>> = OnceLock::new();
+    const CURRENT_OS: TargetOs = TargetOs::current();
 
     /// Prewarm the cache of the announcement tip.
-    pub(crate) fn prewarm() {
-        let _ = thread::spawn(|| ANNOUNCEMENT_TIP.get_or_init(init_announcement_tip_in_thread));
+    pub(crate) fn prewarm(http_client_factory: HttpClientFactory) {
+        if ANNOUNCEMENT_TIP.get().is_some() {
+            return;
+        }
+        tokio::spawn(async move {
+            let announcement_tip = fetch_announcement_tip_text(http_client_factory).await;
+            let _ = ANNOUNCEMENT_TIP.set(announcement_tip);
+        });
     }
 
     /// Fetch the announcement tip, return None if the prewarm is not done yet.
-    pub(crate) fn fetch_announcement_tip() -> Option<String> {
+    pub(crate) fn fetch_announcement_tip(plan: Option<PlanType>) -> Option<String> {
         ANNOUNCEMENT_TIP
             .get()
             .cloned()
             .flatten()
-            .and_then(|raw| parse_announcement_tip_toml(&raw))
+            .and_then(|raw| parse_announcement_tip_toml(&raw, plan))
     }
 
     #[derive(Debug, Deserialize)]
@@ -152,6 +198,8 @@ pub(crate) mod announcement {
         to_date: Option<String>,
         version_regex: Option<String>,
         target_app: Option<String>,
+        target_plan_types: Option<Vec<PlanType>>,
+        target_oses: Option<Vec<TargetOs>>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -166,30 +214,48 @@ pub(crate) mod announcement {
         to_date: Option<NaiveDate>,
         version_regex: Option<Regex>,
         target_app: String,
+        target_plan_types: Option<Vec<PlanType>>,
+        target_oses: Option<Vec<TargetOs>>,
     }
 
-    fn init_announcement_tip_in_thread() -> Option<String> {
-        thread::spawn(blocking_init_announcement_tip)
-            .join()
-            .ok()
-            .flatten()
+    #[derive(Debug, Deserialize, Copy, Clone, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    enum TargetOs {
+        Linux,
+        Macos,
+        Windows,
+        #[serde(other)]
+        Unknown,
     }
 
-    fn blocking_init_announcement_tip() -> Option<String> {
-        // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .build()
-            .ok()?;
+    impl TargetOs {
+        const fn current() -> Self {
+            if cfg!(target_os = "macos") {
+                Self::Macos
+            } else if cfg!(target_os = "windows") {
+                Self::Windows
+            } else {
+                // Codex currently publishes CLI builds for macOS, Windows, and Linux.
+                Self::Linux
+            }
+        }
+    }
+
+    async fn fetch_announcement_tip_text(http_client_factory: HttpClientFactory) -> Option<String> {
+        let client = RouteAwareClientPool::new(http_client_factory, ClientRouteClass::Other);
         let response = client
             .get(ANNOUNCEMENT_TIP_URL)
             .timeout(Duration::from_millis(2000))
             .send()
+            .await
             .ok()?;
-        response.error_for_status().ok()?.text().ok()
+        response.error_for_status().ok()?.text().await.ok()
     }
 
-    pub(crate) fn parse_announcement_tip_toml(text: &str) -> Option<String> {
+    pub(crate) fn parse_announcement_tip_toml(
+        text: &str,
+        plan: Option<PlanType>,
+    ) -> Option<String> {
         let announcements = toml::from_str::<AnnouncementTipDocument>(text)
             .map(|doc| doc.announcements)
             .or_else(|_| toml::from_str::<Vec<AnnouncementTipRaw>>(text))
@@ -201,9 +267,19 @@ pub(crate) mod announcement {
             let Some(tip) = AnnouncementTip::from_raw(raw) else {
                 continue;
             };
+            let plan_matches = tip
+                .target_plan_types
+                .as_ref()
+                .is_none_or(|target_plans| plan.is_some_and(|plan| target_plans.contains(&plan)));
+            let os_matches = tip
+                .target_oses
+                .as_ref()
+                .is_none_or(|target_oses| target_oses.contains(&CURRENT_OS));
             if tip.version_matches(CODEX_CLI_VERSION)
                 && tip.date_matches(today)
                 && tip.target_app == "cli"
+                && plan_matches
+                && os_matches
             {
                 latest_match = Some(tip.content);
             }
@@ -230,6 +306,20 @@ pub(crate) mod announcement {
                 Some(pattern) => Some(Regex::new(&pattern).ok()?),
                 None => None,
             };
+            let target_plan_types = raw.target_plan_types;
+            if target_plan_types
+                .as_ref()
+                .is_some_and(|plans| plans.contains(&PlanType::Unknown))
+            {
+                return None;
+            }
+            let target_oses = raw.target_oses;
+            if target_oses
+                .as_ref()
+                .is_some_and(|oses| oses.contains(&TargetOs::Unknown))
+            {
+                return None;
+            }
 
             Some(Self {
                 content: content.to_string(),
@@ -237,6 +327,8 @@ pub(crate) mod announcement {
                 to_date,
                 version_regex,
                 target_app: raw.target_app.unwrap_or("cli".to_string()).to_lowercase(),
+                target_plan_types,
+                target_oses,
             })
         }
 
@@ -266,8 +358,36 @@ pub(crate) mod announcement {
 mod tests {
     use super::*;
     use crate::tooltips::announcement::parse_announcement_tip_toml;
+    use pretty_assertions::assert_eq;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+
+    #[test]
+    fn experimental_voice_tooltip_requires_runtime_support() {
+        let unavailable = experimental_tooltips(|| false);
+        let available = experimental_tooltips(|| true);
+        let voice_tip = FEATURES
+            .iter()
+            .find(|spec| spec.id == Feature::RealtimeConversation)
+            .and_then(|spec| spec.stage.experimental_announcement())
+            .expect("voice has an experimental announcement");
+        assert_eq!(
+            unavailable,
+            available
+                .iter()
+                .copied()
+                .filter(|tip| *tip != voice_tip)
+                .collect::<Vec<_>>()
+        );
+        insta::assert_snapshot!(
+            "experimental_voice_tooltip",
+            available
+                .into_iter()
+                .filter(|tip| *tip == voice_tip)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 
     #[test]
     fn random_tooltip_returns_some_tip_when_available() {
@@ -287,6 +407,54 @@ mod tests {
     }
 
     #[test]
+    fn desktop_app_tooltip_uses_supported_platform_launcher() {
+        let tooltip = TOOLTIPS
+            .iter()
+            .copied()
+            .find(|tip| tip.contains("Desktop app"));
+
+        if linux_app_tooltip(LinuxDesktopSession::current()).is_some() {
+            let tooltip = tooltip.expect("Linux should advertise the desktop app");
+            assert_eq!(paid_app_tooltip(), Some(tooltip));
+        } else if IS_MACOS {
+            let tooltip = tooltip.expect("macOS should advertise the desktop app");
+            insta::assert_snapshot!(tooltip, @"Run `codex app` to open the Desktop app (it installs on macOS if needed).");
+            assert_eq!(paid_app_tooltip(), Some(APP_TOOLTIP));
+        } else if IS_WINDOWS {
+            assert_eq!(tooltip, None);
+            assert_eq!(paid_app_tooltip(), Some(APP_TOOLTIP));
+        } else {
+            assert_eq!(tooltip, None);
+            assert_eq!(paid_app_tooltip(), None);
+        }
+    }
+
+    #[test]
+    fn linux_desktop_app_tooltip_requires_graphical_native_session() {
+        let tooltip = linux_app_tooltip(LinuxDesktopSession {
+            has_display: true,
+            is_wsl: false,
+        })
+        .expect("graphical native Linux should advertise the desktop app");
+        insta::assert_snapshot!(tooltip, @"Try the **Desktop app** on Linux: install it from https://learn.chatgpt.com/docs/linux/linux-app and run 'chatgpt'.");
+
+        assert_eq!(
+            linux_app_tooltip(LinuxDesktopSession {
+                has_display: false,
+                is_wsl: false,
+            }),
+            None
+        );
+        assert_eq!(
+            linux_app_tooltip(LinuxDesktopSession {
+                has_display: true,
+                is_wsl: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn paid_tooltip_pool_rotates_between_promos() {
         let mut seen = std::collections::BTreeSet::new();
         for seed in 0..32 {
@@ -296,7 +464,7 @@ mod tests {
             ));
         }
 
-        let expected = std::collections::BTreeSet::from([paid_app_tooltip(), FAST_TOOLTIP]);
+        let expected = std::collections::BTreeSet::from([paid_app_tooltip(), Some(FAST_TOOLTIP)]);
         assert_eq!(seen, expected);
     }
 
@@ -310,7 +478,7 @@ mod tests {
 
         let expected = std::collections::BTreeSet::from([paid_app_tooltip()]);
         assert_eq!(seen, expected);
-        assert!(!seen.contains(&FAST_TOOLTIP));
+        assert!(!seen.contains(&Some(FAST_TOOLTIP)));
     }
 
     #[test]
@@ -332,7 +500,7 @@ to_date = "2000-01-01"
 
         assert_eq!(
             Some("latest match".to_string()),
-            parse_announcement_tip_toml(toml)
+            parse_announcement_tip_toml(toml, /*plan*/ None)
         );
 
         let toml = r#"
@@ -352,7 +520,7 @@ to_date = "2000-01-01"
 
         assert_eq!(
             Some("latest match".to_string()),
-            parse_announcement_tip_toml(toml)
+            parse_announcement_tip_toml(toml, /*plan*/ None)
         );
     }
 
@@ -373,7 +541,7 @@ content = "should not match either "
 target_app = "vsce"
         "#;
 
-        assert_eq!(None, parse_announcement_tip_toml(toml));
+        assert_eq!(None, parse_announcement_tip_toml(toml, /*plan*/ None));
     }
 
     #[test]
@@ -384,7 +552,7 @@ content = 123
 from_date = "2000-01-01"
         "#;
 
-        assert_eq!(None, parse_announcement_tip_toml(toml));
+        assert_eq!(None, parse_announcement_tip_toml(toml, /*plan*/ None));
     }
 
     #[test]
@@ -395,6 +563,8 @@ from_date = "2000-01-01"
 # Dates are UTC, formatted as YYYY-MM-DD. The from_date is inclusive and the to_date is exclusive.
 # version_regex matches against the CLI version (env!("CARGO_PKG_VERSION")); omit to apply to all versions.
 # target_app specify which app should display the announcement (cli, vsce, ...).
+# target_plan_types optionally restricts the announcement to plan types like ["plus", "pro"].
+# target_oses optionally restricts the announcement to operating systems like ["macos", "windows"].
 
 [[announcements]]
 content = "Welcome to Codex! Check out the new onboarding flow."
@@ -409,7 +579,103 @@ content = "This is a test announcement"
 
         assert_eq!(
             Some("This is a test announcement".to_string()),
-            parse_announcement_tip_toml(toml)
+            parse_announcement_tip_toml(toml, /*plan*/ None)
+        );
+    }
+
+    #[test]
+    fn announcement_tip_toml_matches_target_plan_type() {
+        let toml = r#"
+[[announcements]]
+content = "all plans"
+
+[[announcements]]
+content = "pro announcement"
+target_plan_types = ["pro", "enterprise"]
+
+[[announcements]]
+content = "free announcement"
+target_plan_types = ["free"]
+        "#;
+
+        assert_eq!(
+            Some("pro announcement".to_string()),
+            parse_announcement_tip_toml(toml, Some(PlanType::Pro))
+        );
+        assert_eq!(
+            Some("free announcement".to_string()),
+            parse_announcement_tip_toml(toml, Some(PlanType::Free))
+        );
+        assert_eq!(
+            Some("all plans".to_string()),
+            parse_announcement_tip_toml(toml, Some(PlanType::Plus))
+        );
+        assert_eq!(
+            Some("all plans".to_string()),
+            parse_announcement_tip_toml(toml, /*plan*/ None)
+        );
+    }
+
+    #[test]
+    fn announcement_tip_toml_rejects_unknown_target_plan_type() {
+        let toml = r#"
+[[announcements]]
+content = "all plans"
+
+[[announcements]]
+content = "typo announcement"
+target_plan_types = ["prp"]
+        "#;
+
+        assert_eq!(
+            Some("all plans".to_string()),
+            parse_announcement_tip_toml(toml, Some(PlanType::Unknown))
+        );
+    }
+
+    #[test]
+    fn announcement_tip_toml_matches_target_os() {
+        let toml = r#"
+[[announcements]]
+content = "linux announcement"
+target_oses = ["linux"]
+
+[[announcements]]
+content = "macos announcement"
+target_oses = ["macos"]
+
+[[announcements]]
+content = "windows announcement"
+target_oses = ["windows"]
+        "#;
+
+        let expected = if cfg!(target_os = "macos") {
+            "macos announcement"
+        } else if cfg!(target_os = "windows") {
+            "windows announcement"
+        } else {
+            "linux announcement"
+        };
+        assert_eq!(
+            Some(expected.to_string()),
+            parse_announcement_tip_toml(toml, /*plan*/ None)
+        );
+    }
+
+    #[test]
+    fn announcement_tip_toml_rejects_unknown_target_os() {
+        let toml = r#"
+[[announcements]]
+content = "all operating systems"
+
+[[announcements]]
+content = "typo announcement"
+target_oses = ["amiga"]
+        "#;
+
+        assert_eq!(
+            Some("all operating systems".to_string()),
+            parse_announcement_tip_toml(toml, /*plan*/ None)
         );
     }
 }

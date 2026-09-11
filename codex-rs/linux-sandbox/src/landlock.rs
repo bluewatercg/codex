@@ -5,11 +5,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use codex_core::error::CodexErr;
-use codex_core::error::Result;
-use codex_core::error::SandboxErr;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result;
+use codex_protocol::error::SandboxErr;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::NetworkSandboxPolicy;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use landlock::ABI;
@@ -36,29 +36,38 @@ use seccompiler::apply_filter;
 ///
 /// This function is responsible for:
 /// - enabling `PR_SET_NO_NEW_PRIVS` when restrictions apply, and
-/// - installing the network seccomp filter when network access is disabled.
+/// - installing seccomp restrictions for network isolation and VM sockets.
 ///
 /// Filesystem restrictions are intentionally handled by bubblewrap.
-pub(crate) fn apply_sandbox_policy_to_current_thread(
-    sandbox_policy: &SandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
+pub(crate) fn apply_permission_profile_to_current_thread(
+    permission_profile: &PermissionProfile,
     cwd: &Path,
     apply_landlock_fs: bool,
     allow_network_for_proxy: bool,
     proxy_routed_network: bool,
 ) -> Result<()> {
+    let (file_system_sandbox_policy, network_sandbox_policy) =
+        permission_profile.to_runtime_permissions();
     let network_seccomp_mode = network_seccomp_mode(
         network_sandbox_policy,
         allow_network_for_proxy,
         proxy_routed_network,
-    );
+    )
+    .or_else(|| {
+        // VM sockets can reach host services outside the filesystem sandbox.
+        // In WSL2 they also allow Windows process launch through an alias of
+        // the interop socket, even when /run/WSL is masked. Keep ordinary
+        // network access while denying that host bridge.
+        (!file_system_sandbox_policy.has_full_disk_write_access())
+            .then_some(NetworkSeccompMode::VmSocketRestricted)
+    });
 
     // `PR_SET_NO_NEW_PRIVS` is required for seccomp, but it also prevents
     // setuid privilege elevation. Many `bwrap` deployments rely on setuid, so
     // we avoid this unless we need seccomp or we are explicitly using the
     // legacy Landlock filesystem pipeline.
     if network_seccomp_mode.is_some()
-        || (apply_landlock_fs && !sandbox_policy.has_full_disk_write_access())
+        || (apply_landlock_fs && !file_system_sandbox_policy.has_full_disk_write_access())
     {
         set_no_new_privs()?;
     }
@@ -67,15 +76,15 @@ pub(crate) fn apply_sandbox_policy_to_current_thread(
         install_network_seccomp_filter_on_current_thread(mode)?;
     }
 
-    if apply_landlock_fs && !sandbox_policy.has_full_disk_write_access() {
-        if !sandbox_policy.has_full_disk_read_access() {
+    if apply_landlock_fs && !file_system_sandbox_policy.has_full_disk_write_access() {
+        if !file_system_sandbox_policy.has_full_disk_read_access() {
             return Err(CodexErr::UnsupportedOperation(
                 "Restricted read-only access is not supported by the legacy Linux Landlock filesystem backend."
                     .to_string(),
             ));
         }
 
-        let writable_roots = sandbox_policy
+        let writable_roots = file_system_sandbox_policy
             .get_writable_roots_with_cwd(cwd)
             .into_iter()
             .map(|writable_root| writable_root.root)
@@ -90,6 +99,7 @@ pub(crate) fn apply_sandbox_policy_to_current_thread(
 enum NetworkSeccompMode {
     Restricted,
     ProxyRouted,
+    VmSocketRestricted,
 }
 
 fn should_install_network_seccomp(
@@ -175,7 +185,13 @@ fn install_network_seccomp_filter_on_current_thread(
     // Build rule map.
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    deny_syscall(&mut rules, libc::SYS_ptrace);
+    if mode != NetworkSeccompMode::VmSocketRestricted {
+        deny_syscall(&mut rules, libc::SYS_ptrace);
+        deny_syscall(&mut rules, libc::SYS_process_vm_readv);
+        deny_syscall(&mut rules, libc::SYS_process_vm_writev);
+    }
+    // io_uring can create AF_VSOCK sockets without a socket() syscall, so
+    // keep it unavailable in every mode with socket-family restrictions.
     deny_syscall(&mut rules, libc::SYS_io_uring_setup);
     deny_syscall(&mut rules, libc::SYS_io_uring_enter);
     deny_syscall(&mut rules, libc::SYS_io_uring_register);
@@ -214,10 +230,11 @@ fn install_network_seccomp_filter_on_current_thread(
         }
         NetworkSeccompMode::ProxyRouted => {
             // In proxy-routed mode we allow IP sockets in the isolated
-            // namespace (used to reach the local TCP bridge) but deny all
-            // other socket families, including AF_UNIX. This prevents
-            // bypassing the routed bridge via new Unix sockets and narrows the
-            // socket surface in proxy-only mode.
+            // namespace (used to reach the local TCP bridge) but deny socket()
+            // for all other families, including AF_UNIX. Only AF_UNIX
+            // socketpair() remains available for process-local IPC because it
+            // cannot connect to a socket outside the sandbox or bypass the
+            // bridge.
             let deny_non_ip_socket = SeccompRule::new(vec![
                 SeccompCondition::new(
                     0,
@@ -232,14 +249,24 @@ fn install_network_seccomp_filter_on_current_thread(
                     libc::AF_INET6 as u64,
                 )?,
             ])?;
-            let deny_unix_socketpair = SeccompRule::new(vec![SeccompCondition::new(
+            let deny_non_unix_socketpair = SeccompRule::new(vec![SeccompCondition::new(
                 0,
                 SeccompCmpArgLen::Dword,
-                SeccompCmpOp::Eq,
+                SeccompCmpOp::Ne,
                 libc::AF_UNIX as u64,
             )?])?;
             rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
-            rules.insert(libc::SYS_socketpair, vec![deny_unix_socketpair]);
+            rules.insert(libc::SYS_socketpair, vec![deny_non_unix_socketpair]);
+        }
+        NetworkSeccompMode::VmSocketRestricted => {
+            let deny_vsock = SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_VSOCK as u64,
+            )?])?;
+            rules.insert(libc::SYS_socket, vec![deny_vsock.clone()]);
+            rules.insert(libc::SYS_socketpair, vec![deny_vsock]);
         }
     }
 

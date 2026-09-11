@@ -1,20 +1,33 @@
+use anyhow::Context;
 use anyhow::Result;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::GetLastError;
-use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_INFO_1;
+use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
+use windows_sys::Win32::NetworkManagement::NetManagement::NERR_UserNotFound;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAdd;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetUserGetInfo;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetUserSetInfo;
+use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1;
+use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1008;
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::LookupAccountNameW;
 use windows_sys::Win32::Security::SID_NAME_USE;
-use windows_sys::Win32::System::Diagnostics::Debug::FormatMessageW;
 use windows_sys::Win32::System::Diagnostics::Debug::FORMAT_MESSAGE_ALLOCATE_BUFFER;
 use windows_sys::Win32::System::Diagnostics::Debug::FORMAT_MESSAGE_FROM_SYSTEM;
 use windows_sys::Win32::System::Diagnostics::Debug::FORMAT_MESSAGE_IGNORE_INSERTS;
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::System::Diagnostics::Debug::FormatMessageW;
+
+pub const SANDBOX_USERS_GROUP: &str = "CodexSandboxUsers";
+const SANDBOX_USERS_GROUP_COMMENT: &str = "Codex sandbox internal group (managed)";
 
 pub fn to_wide<S: AsRef<OsStr>>(s: S) -> Vec<u16> {
     let mut v: Vec<u16> = s.as_ref().encode_wide().collect();
@@ -64,6 +77,15 @@ pub fn quote_windows_arg(arg: &str) -> String {
     quoted
 }
 
+/// Build a Windows command line for CreateProcess-style APIs.
+#[cfg(target_os = "windows")]
+pub fn argv_to_command_line(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // Produce a readable description for a Win32 error code.
 pub fn format_last_error(err: i32) -> String {
     unsafe {
@@ -83,7 +105,7 @@ pub fn format_last_error(err: i32) -> String {
             std::ptr::null_mut(),
         );
         if len == 0 || buf_ptr.is_null() {
-            return format!("Win32 error {}", err);
+            return format!("Win32 error {err}");
         }
         let slice = std::slice::from_raw_parts(buf_ptr, len as usize);
         let mut s = String::from_utf16_lossy(slice);
@@ -98,7 +120,10 @@ pub fn string_from_sid_bytes(sid: &[u8]) -> Result<String, String> {
         let mut str_ptr: *mut u16 = std::ptr::null_mut();
         let ok = ConvertSidToStringSidW(sid.as_ptr() as *mut std::ffi::c_void, &mut str_ptr);
         if ok == 0 || str_ptr.is_null() {
-            return Err(format!("ConvertSidToStringSidW failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "ConvertSidToStringSidW failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let mut len = 0;
         while *str_ptr.add(len) != 0 {
@@ -116,6 +141,78 @@ const SID_USERS: &str = "S-1-5-32-545";
 const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 const SID_EVERYONE: &str = "S-1-1-0";
 const SID_SYSTEM: &str = "S-1-5-18";
+
+pub fn local_user_flags(name: &str) -> Result<Option<u32>> {
+    let name_wide = to_wide(name);
+    let mut buffer = std::ptr::null_mut();
+    let status = unsafe {
+        NetUserGetInfo(
+            std::ptr::null(),
+            name_wide.as_ptr(),
+            /*level*/ 1,
+            &mut buffer,
+        )
+    };
+    if status == NERR_UserNotFound {
+        return Ok(None);
+    }
+    if status != NERR_Success {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!("read local sandbox user {name}"));
+    }
+    let flags = unsafe { (*buffer.cast::<USER_INFO_1>()).usri1_flags };
+    unsafe { NetApiBufferFree(buffer.cast()) };
+    Ok(Some(flags))
+}
+
+pub fn set_local_user_flags(name: &str, flags: u32) -> Result<()> {
+    let name_wide = to_wide(name);
+    let info = USER_INFO_1008 {
+        usri1008_flags: flags,
+    };
+    let status = unsafe {
+        NetUserSetInfo(
+            std::ptr::null(),
+            name_wide.as_ptr(),
+            /*level*/ 1008,
+            (&raw const info).cast(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status != NERR_Success {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!("set local sandbox user {name} flags"));
+    }
+    Ok(())
+}
+
+pub fn ensure_sandbox_users_group() -> Result<Vec<u8>> {
+    const ERROR_ALIAS_EXISTS: u32 = 1379;
+    const NERR_GROUP_EXISTS: u32 = 2223;
+
+    let name = to_wide(SANDBOX_USERS_GROUP);
+    let comment = to_wide(SANDBOX_USERS_GROUP_COMMENT);
+    let info = LOCALGROUP_INFO_1 {
+        lgrpi1_name: name.as_ptr() as *mut u16,
+        lgrpi1_comment: comment.as_ptr() as *mut u16,
+    };
+    let mut parameter_error = 0;
+    let status = unsafe {
+        NetLocalGroupAdd(
+            std::ptr::null(),
+            1,
+            (&raw const info).cast(),
+            &raw mut parameter_error,
+        )
+    };
+    if status != NERR_Success && status != ERROR_ALIAS_EXISTS && status != NERR_GROUP_EXISTS {
+        return Err(anyhow::anyhow!(
+            "NetLocalGroupAdd failed for {SANDBOX_USERS_GROUP} code {status} parm_err={parameter_error}"
+        ));
+    }
+
+    resolve_sid(SANDBOX_USERS_GROUP)
+}
 
 pub fn resolve_sid(name: &str) -> Result<Vec<u8>> {
     if let Some(sid_str) = well_known_sid_str(name) {
@@ -149,7 +246,9 @@ pub fn resolve_sid(name: &str) -> Result<Vec<u8>> {
             domain.resize(domain_len as usize, 0);
             continue;
         }
-        return Err(anyhow::anyhow!("LookupAccountNameW failed for {name}: {err}"));
+        return Err(anyhow::anyhow!(
+            "LookupAccountNameW failed for {name}: {err}"
+        ));
     }
 }
 
@@ -164,7 +263,7 @@ fn well_known_sid_str(name: &str) -> Option<&'static str> {
     }
 }
 
-fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
+pub(crate) fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
     let sid_w = to_wide(OsStr::new(sid_str));
     let mut psid: *mut std::ffi::c_void = std::ptr::null_mut();
     if unsafe { ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 {
@@ -189,4 +288,39 @@ fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
         return Err(anyhow::anyhow!("CopySid failed for {sid_str}"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::argv_to_command_line;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn argv_to_command_line_quotes_each_argument_independently() {
+        let argv = vec![
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -EncodedCommand abc=="
+                .to_string(),
+        ];
+
+        assert_eq!(
+            argv_to_command_line(&argv),
+            "cmd.exe /c \"\\\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\\\" -NoProfile -EncodedCommand abc==\""
+        );
+    }
+
+    #[test]
+    fn argv_to_command_line_quotes_regular_program_args() {
+        let argv = vec![
+            "pwsh.exe".to_string(),
+            "-Command".to_string(),
+            "Write-Output \"hello world\"".to_string(),
+        ];
+
+        assert_eq!(
+            argv_to_command_line(&argv),
+            "pwsh.exe -Command \"Write-Output \\\"hello world\\\"\""
+        );
+    }
 }
